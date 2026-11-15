@@ -47,6 +47,12 @@ bool ptts_set_temperature(PttsHandle *h, float temperature);
 /// Seed the sampling from every ptts_speak on until it is set again: on the same device and model,
 /// the same seed gives the same audio, another seed another take of the same text.
 void ptts_set_seed(PttsHandle *h, uint64_t seed);
+/// Let each chunk run on past the end-of-speech tail while the voice is still sounding, from the
+/// next ptts_speak on: up to `max_frames` more frames while its last 20 ms are at least `threshold`
+/// RMS, each kept only while the sound fades. 0.02 and 4 suit the published checkpoints;
+/// `max_frames` 0 turns it off, the default. False for a threshold not finite and above zero, and
+/// on Core ML.
+bool ptts_set_fade_tail(PttsHandle *h, float threshold, uint32_t max_frames);
 /// The last error on `h`, or the last ptts_new failure on this thread when `h` is NULL.
 const char *ptts_last_error(const PttsHandle *h);
 void ptts_free(PttsHandle *h);

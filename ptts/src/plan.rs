@@ -133,6 +133,98 @@ impl FadeIn {
     }
 }
 
+/// Lets a chunk run on past its EOS tail while the voice is still sounding.
+///
+/// The tail [`EosPolicy`] runs is a fixed count of frames, enough for speech that has faded by
+/// the time the model signals the end. A loud ending (a laugh, a shout, a drawn-out "hmm") can
+/// still be sounding when the count runs out, and is then cut off mid-sound. With a fade tail,
+/// the end of that last frame is measured: when its last 20 ms are at least [`Self::threshold`]
+/// RMS, up to [`Self::max_frames`] more frames are generated, each kept only while the sound
+/// fades. A frame with any 20 ms louder than the end of the audio before it is a new sound the
+/// model started after deciding it was done: it is dropped, and the tail ends there.
+///
+/// Off unless asked for, through [`crate::synth::SpeechOptions::fade_tail`]. [`FadeRun`] applies
+/// it to one chunk.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FadeTail {
+    /// RMS, of samples in [-1, 1], at or above which an ending still counts as sounding.
+    pub threshold: f32,
+    /// The most frames added after the EOS tail.
+    pub max_frames: usize,
+}
+
+impl FadeTail {
+    /// Refuses a threshold that is not finite and above zero, which would extend every chunk or
+    /// none; zero frames is allowed and adds none.
+    pub fn check(&self) -> Result<()> {
+        if !self.threshold.is_finite() || self.threshold <= 0.0 {
+            return Err(Error::invalid_argument(format!(
+                "fade tail threshold must be finite and > 0, got {}",
+                self.threshold
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// How much louder than the end before it a kept tail frame may get.
+const FADE_SLACK: f32 = 1.1;
+
+/// One chunk's [`FadeTail`], from the end of its EOS tail on.
+#[derive(Clone, Copy, Debug)]
+pub struct FadeRun {
+    threshold: f32,
+    window: usize,
+    /// End loudness of the audio so far.
+    level: f32,
+    /// Frames that may still be added.
+    left: usize,
+}
+
+impl FadeRun {
+    /// The run after an EOS tail whose audio ends with `last` at `sample_rate`, with room for
+    /// `room` more frames in the chunk's budget; `None` when the ending has already faded.
+    pub fn start(tail: FadeTail, sample_rate: usize, last: &[f32], room: usize) -> Option<Self> {
+        let window = (sample_rate / 50).max(1);
+        let level = rms(&last[last.len().saturating_sub(window)..]);
+        let left = tail.max_frames.min(room);
+        (left > 0 && level >= tail.threshold).then_some(Self {
+            threshold: tail.threshold,
+            window,
+            level,
+            left,
+        })
+    }
+
+    /// Whether another frame may be generated.
+    pub fn more(&self) -> bool {
+        self.left > 0
+    }
+
+    /// Judges the next frame's audio: true to keep it. After a dropped frame, or one that has
+    /// faded below the threshold, [`Self::more`] is false.
+    pub fn take(&mut self, pcm: &[f32]) -> bool {
+        if self.left == 0 {
+            return false;
+        }
+        let peak = pcm.chunks(self.window).map(rms).fold(0.0, f32::max);
+        if peak > self.level * FADE_SLACK {
+            self.left = 0;
+            return false;
+        }
+        self.level = rms(&pcm[pcm.len().saturating_sub(self.window)..]);
+        self.left = if self.level >= self.threshold { self.left - 1 } else { 0 };
+        true
+    }
+}
+
+fn rms(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    (pcm.iter().map(|s| s * s).sum::<f32>() / pcm.len() as f32).sqrt()
+}
+
 /// One piece of the text, ready to prompt the model with.
 ///
 /// Built by [`chunks`] or [`Chunk::new`], so the budgets always match the tokens.
@@ -686,5 +778,66 @@ mod tests {
         let mut next = vec![1.0f32; len + 5];
         fade.apply(&mut next);
         assert_eq!(next, whole);
+    }
+
+    const RATE: usize = 24_000;
+    const FRAME: usize = 1_920;
+    const TAIL: FadeTail = FadeTail { threshold: 0.02, max_frames: 4 };
+
+    /// A frame of a tone whose amplitude slides from `from` to `to`.
+    fn tone(from: f32, to: f32) -> Vec<f32> {
+        (0..FRAME)
+            .map(|i| {
+                let t = i as f32 / FRAME as f32;
+                (from + (to - from) * t) * (i as f32 * 0.1).sin()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_faded_ending_gets_no_fade_tail() {
+        assert!(FadeRun::start(TAIL, RATE, &tone(0.02, 0.001), 10).is_none());
+        assert!(FadeRun::start(TAIL, RATE, &[], 10).is_none());
+    }
+
+    #[test]
+    fn a_loud_ending_runs_on_while_it_fades() {
+        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.2), 10).unwrap();
+        assert!(run.take(&tone(0.2, 0.1)));
+        assert!(run.more());
+        // Faded below the threshold: kept, and the last.
+        assert!(run.take(&tone(0.1, 0.005)));
+        assert!(!run.more());
+        assert!(!run.take(&tone(0.005, 0.0)));
+    }
+
+    #[test]
+    fn a_new_sound_after_the_tail_is_dropped() {
+        let mut run = FadeRun::start(TAIL, RATE, &tone(0.1, 0.05), 10).unwrap();
+        assert!(!run.take(&tone(0.05, 0.3)));
+        assert!(!run.more());
+    }
+
+    #[test]
+    fn a_fade_tail_stops_at_its_frame_cap_and_the_budget() {
+        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 10).unwrap();
+        for _ in 0..4 {
+            assert!(run.take(&tone(0.3, 0.3)));
+        }
+        assert!(!run.more());
+        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 1).unwrap();
+        assert!(run.take(&tone(0.3, 0.3)));
+        assert!(!run.more());
+        assert!(FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 0).is_none());
+        let none = FadeTail { threshold: 0.02, max_frames: 0 };
+        assert!(FadeRun::start(none, RATE, &tone(0.3, 0.3), 10).is_none());
+    }
+
+    #[test]
+    fn a_fade_tail_needs_a_positive_threshold() {
+        assert!(TAIL.check().is_ok());
+        for threshold in [0.0, -0.1, f32::NAN, f32::INFINITY] {
+            assert!(FadeTail { threshold, max_frames: 4 }.check().is_err());
+        }
     }
 }
