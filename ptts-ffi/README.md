@@ -93,7 +93,7 @@ writable.
 
 ## 3. The interface
 
-[`ptts.h`](include/ptts.h) has ten calls:
+[`ptts.h`](include/ptts.h) has eleven calls:
 
 | Call | What it does |
 |---|---|
@@ -104,6 +104,7 @@ writable.
 | `ptts_set_language(h, lang)` | Normalize text as `lang` from now on, with no reload. |
 | `ptts_set_temperature(h, t)` | Sample at temperature `t` from now on. Higher varies more, 0 removes the randomness. |
 | `ptts_set_seed(h, seed)` | Seed the sampling from now on. The seed stays until set again, so the same text gives the same take; another seed gives another. |
+| `ptts_set_fade_tail(h, threshold, max_frames)` | Let a chunk run on, by up to `max_frames` frames, while its ending is at least `threshold` RMS and fading, so a loud ending such as a laugh is not cut off mid-sound. 0.02 and 4 suit the published checkpoints; 0 frames turns it off, the default. CPU only. |
 | `ptts_speak(h, text, callback, user, &result)` | Speak `text`, passing the audio to `callback` as it is made. |
 | `ptts_last_error(h)` | Why the last call failed. Pass `NULL` after a failed `ptts_new`. |
 | `ptts_free(h)` | Free the model. Nothing else does. |
@@ -120,7 +121,8 @@ Every binding follows the same rules:
   `it`, `nl` and `ja` normalize numbers and symbols for that language, and `none` reads the text
   as written.
 - **Errors.** `ptts_new` returns `NULL` on failure, and `ptts_speak`, `ptts_set_voice`,
-  `ptts_set_language` and `ptts_set_temperature` return `false`. Then `ptts_last_error` says why.
+  `ptts_set_language`, `ptts_set_temperature` and `ptts_set_fade_tail` return `false`. Then
+  `ptts_last_error` says why.
 - **Strings from the library are borrowed.** Those from `ptts_voices`, `ptts_languages` and
   `ptts_last_error` belong to the library: copy them if you keep them.
 - **Set the thread count** of the CPU engine with the `RAYON_NUM_THREADS` environment variable,
