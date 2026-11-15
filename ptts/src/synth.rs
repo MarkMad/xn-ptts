@@ -61,7 +61,8 @@ use crate::comp::{AudioModule, Chain, ModuleConfig};
 use crate::conditioners::Conditioners;
 use crate::flow_lm::{NormalRng, StepInput};
 use crate::loader;
-use crate::plan::{self, Chunk, EosPolicy};
+pub use crate::plan::FadeTail;
+use crate::plan::{self, Chunk, EosPolicy, FadeRun};
 use crate::preprocess::Normalize;
 use crate::step_graph::{GRAPH_SIZES, GraphPool, StepGraph};
 use crate::tts_model::{MAX_TOKENS_PER_CHUNK, MimiEnc, MimiLatent, TTSConfig, TTSModel, TTSState};
@@ -240,9 +241,17 @@ pub struct SpeechOptions {
     pub max_tokens_per_chunk: Option<usize>,
     /// Audio modules run over the PCM, in order, before it is handed out.
     pub post_process: Option<Vec<ModuleConfig>>,
+    /// Let a chunk run on past its EOS tail while the voice is still sounding; see
+    /// [`FadeTail`]. Off by default.
+    pub fade_tail: Option<FadeTail>,
 }
 
 impl SpeechOptions {
+    pub fn fade_tail(mut self, tail: FadeTail) -> Self {
+        self.fade_tail = Some(tail);
+        self
+    }
+
     pub fn voice(mut self, voice: impl Into<String>) -> Self {
         self.voice = Some(voice.into());
         self
@@ -283,6 +292,7 @@ struct Defaults {
     cfg_coef: Option<f32>,
     max_tokens_per_chunk: usize,
     post_process: Vec<ModuleConfig>,
+    fade_tail: Option<FadeTail>,
 }
 
 /// Merge per-request overrides onto the settings a [`SynthBuilder`] was given.
@@ -304,6 +314,10 @@ fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
             "temperature must be >= 0, got {temperature}"
         )));
     }
+    let fade_tail = opts.fade_tail.or(defaults.fade_tail);
+    if let Some(tail) = fade_tail {
+        tail.check()?;
+    }
     Ok(Defaults {
         voice: opts.voice.clone().or_else(|| defaults.voice.clone()),
         temperature,
@@ -314,6 +328,7 @@ fn resolve(defaults: &Defaults, opts: &SpeechOptions) -> Result<Defaults> {
         },
         max_tokens_per_chunk: opts.max_tokens_per_chunk.unwrap_or(defaults.max_tokens_per_chunk),
         post_process: opts.post_process.clone().unwrap_or_else(|| defaults.post_process.clone()),
+        fade_tail,
     })
 }
 
@@ -421,6 +436,7 @@ impl<Q: BackendQ> SynthOf<Q> {
             seq_budget,
             normalize: self.normalize,
             post_process: settings.post_process.clone(),
+            fade_tail: settings.fade_tail,
             inline_decode: self.inline_decode,
             graphs: Arc::clone(&self.graphs),
         })
@@ -902,6 +918,8 @@ struct SessionOf<Q: BackendQ> {
     prompt_len: usize,
     /// Audio modules run over every generation's PCM, fresh for each one.
     post_process: Vec<ModuleConfig>,
+    /// See [`SpeechOptions::fade_tail`].
+    fade_tail: Option<FadeTail>,
     /// Set while a generation is running. See the note on this type.
     in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// See [`SynthOf::inline_decode`].
@@ -983,6 +1001,8 @@ impl<Q: BackendQ> SessionOf<Q> {
 
         let (pcm_tx, pcm_rx) = std::sync::mpsc::sync_channel::<Result<Vec<f32>>>(PCM_QUEUE);
 
+        let fade_tail = self.fade_tail;
+        let sample_rate = self.sample_rate() as usize;
         let workers = if self.inline_decode {
             // One shared command queue (Metal): a second thread has no second execution
             // unit to overlap onto, and only adds cross-thread contention for that queue. Decode
@@ -993,7 +1013,10 @@ impl<Q: BackendQ> SessionOf<Q> {
                 let _in_flight = in_flight;
                 let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
-                    run_inline(&model, graph, chunks, base, cfg, rng, mimi_init, &pcm_tx, post)
+                    let fade = fade_tail.map(|tail| (tail, sample_rate));
+                    run_inline(
+                        &model, graph, chunks, base, cfg, rng, mimi_init, &pcm_tx, post, fade,
+                    )
                 });
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
@@ -1008,6 +1031,11 @@ impl<Q: BackendQ> SessionOf<Q> {
             // back, the flow-LM loses one decode's time, far ahead of real time.
             let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
 
+            // With a fade tail, the flow-LM asks the decoder, which alone hears the audio, whether
+            // the tail should run on, and then whether to keep each frame it adds.
+            let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<bool>();
+            let verdict_rx = fade_tail.map(|_| verdict_rx);
+
             // Decoder: latents in, PCM out. Reset between chunks so each chunk
             // starts from a clean codec state, matching the pre-refactor behavior.
             let decode_model = Arc::clone(&self.model);
@@ -1018,10 +1046,58 @@ impl<Q: BackendQ> SessionOf<Q> {
                 // The post-processing chain delays its output: its first `skip` samples are the
                 // zeros it was primed with, dropped here, and the stream's last are flushed below.
                 let mut skip = post.latency();
-                while let Ok(frame) = latent_rx.recv() {
+                // The end of the last audio decoded, before post-processing, and the fade tail
+                // under way, if any.
+                let mut last = Vec::new();
+                let mut run: Option<FadeRun> = None;
+                // A tail message found while batching, handled once the batch is out.
+                let mut pending: Option<Frame<Q>> = None;
+                loop {
+                    let frame = match pending.take() {
+                        Some(frame) => frame,
+                        None => match latent_rx.recv() {
+                            Ok(frame) => frame,
+                            Err(_) => break,
+                        },
+                    };
                     let first = match frame {
                         Frame::ChunkEnd => {
                             state = mimi_init.clone();
+                            run = None;
+                            continue;
+                        }
+                        Frame::TailQuery => {
+                            run = fade_tail.and_then(|tail| {
+                                FadeRun::start(tail, sample_rate, &last, usize::MAX)
+                            });
+                            if verdict_tx.send(run.is_some()).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        Frame::Tail(latent) => {
+                            let pcm = decode_model
+                                .mimi_latent(latent)
+                                .map_err(Error::from)
+                                .and_then(|latent| decode_pcm(&decode_model, &latent, &mut state));
+                            let mut pcm = match pcm {
+                                Ok(pcm) => pcm,
+                                Err(e) => {
+                                    let _ = decode_tx.send(Err(e));
+                                    return;
+                                }
+                            };
+                            let keep = run.as_mut().is_some_and(|run| run.take(&pcm));
+                            if keep {
+                                post_pcm(&mut post, &mut skip, &mut pcm);
+                                if decode_tx.send(Ok(pcm)).is_err() {
+                                    return;
+                                }
+                            }
+                            let more = keep && run.as_ref().is_some_and(FadeRun::more);
+                            if verdict_tx.send(more).is_err() {
+                                return;
+                            }
                             continue;
                         }
                         Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
@@ -1048,6 +1124,12 @@ impl<Q: BackendQ> SessionOf<Q> {
                                 reset_after = true;
                                 break;
                             }
+                            // The flow-LM waits for the answer, so nothing follows a tail
+                            // message: it ends the batch.
+                            Frame::TailQuery | Frame::Tail(_) => {
+                                pending = Some(frame);
+                                break;
+                            }
                             Frame::Latent(latent) => match decode_model.mimi_latent(latent) {
                                 Ok(latent) => batch.push(latent),
                                 Err(e) => {
@@ -1067,17 +1149,13 @@ impl<Q: BackendQ> SessionOf<Q> {
                             }
                         },
                     };
-                    let pcm = decode_model
-                        .decode_latent(&latent, &mut state)
-                        .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                        .map(|mut pcm| {
-                            post.process(&mut pcm);
-                            let n = skip.min(pcm.len());
-                            skip -= n;
-                            pcm.drain(..n);
-                            pcm
-                        })
-                        .map_err(Error::from);
+                    let pcm = decode_pcm(&decode_model, &latent, &mut state).map(|mut pcm| {
+                        if fade_tail.is_some() {
+                            keep_end(&mut last, &pcm, sample_rate);
+                        }
+                        post_pcm(&mut post, &mut skip, &mut pcm);
+                        pcm
+                    });
                     let failed = pcm.is_err();
                     if decode_tx.send(pcm).is_err() || failed {
                         return;
@@ -1087,6 +1165,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     }
                     if reset_after {
                         state = mimi_init.clone();
+                        run = None;
                     }
                 }
                 let latency = post.latency();
@@ -1106,7 +1185,17 @@ impl<Q: BackendQ> SessionOf<Q> {
                 let _in_flight = in_flight;
                 let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
-                    run_backbone(&model, graph, chunks, base, cfg, rng, &latent_tx, first_rx)
+                    run_backbone(
+                        &model,
+                        graph,
+                        chunks,
+                        base,
+                        cfg,
+                        rng,
+                        &latent_tx,
+                        first_rx,
+                        verdict_rx.as_ref(),
+                    )
                 });
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
@@ -1222,6 +1311,37 @@ const DECODE_BATCH: usize = LATENT_QUEUE;
 enum Frame<Q: BackendQ> {
     Latent(MimiLatent<Q>),
     ChunkEnd,
+    /// The EOS tail has ended: should a fade tail run on? The decoder answers on the verdict
+    /// channel, once it has decoded everything sent before.
+    TailQuery,
+    /// A frame the fade tail added. The decoder keeps or drops it, and answers whether another
+    /// may follow.
+    Tail(MimiLatent<Q>),
+}
+
+/// One or more frames' audio, mono.
+fn decode_pcm<Q: BackendQ>(
+    model: &TTSModel<Q>,
+    latent: &Tensor<Q::T, Q::B>,
+    state: &mut crate::mimi::MimiDecoderState<f32, Q::B>,
+) -> Result<Vec<f32>> {
+    Ok(model
+        .decode_latent(latent, state)
+        .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())?)
+}
+
+/// Runs the post-processing chain over `pcm`, dropping the first `skip` samples it delays by.
+fn post_pcm(post: &mut Chain, skip: &mut usize, pcm: &mut Vec<f32>) {
+    post.process(pcm);
+    let n = (*skip).min(pcm.len());
+    *skip -= n;
+    pcm.drain(..n);
+}
+
+/// Keeps the last 20 ms of `pcm` in `last`, for [`FadeRun::start`].
+fn keep_end(last: &mut Vec<f32>, pcm: &[f32], sample_rate: usize) {
+    last.clear();
+    last.extend_from_slice(&pcm[pcm.len().saturating_sub(sample_rate / 50)..]);
 }
 
 /// A chunk's flow-LM state: the stream's own copy of the primed state, with its null branch
@@ -1329,6 +1449,7 @@ fn run_backbone<Q: BackendQ>(
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
     first_decoded: std::sync::mpsc::Receiver<()>,
+    verdicts: Option<&std::sync::mpsc::Receiver<bool>>,
 ) -> Result<()> {
     // Taken after the first frame: only the stream's first audio is worth the wait.
     let mut first_decoded = Some(first_decoded);
@@ -1337,8 +1458,10 @@ fn run_backbone<Q: BackendQ>(
             Flow::start(model, base_state, cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
+        // The last frame and the frames used, when EOS ended the chunk rather than its budget.
+        let mut ended = None;
 
-        for _ in 0..chunk.frame_budget {
+        for used in 1..=chunk.frame_budget {
             let (next, frame_eos) = flow.step(model, prev.as_ref(), &mut rng)?;
             let is_eos = frame_eos.resolve(model)?;
             // A closed channel means the consumer went away; stop quietly and
@@ -1353,9 +1476,28 @@ fn run_backbone<Q: BackendQ>(
                 return Ok(());
             }
             if eos.should_stop(is_eos) {
+                ended = Some((next, used));
                 break;
             }
             prev = Some(next);
+        }
+        // A fade tail stays inside the chunk's frame budget, which sized the KV cache.
+        if let (Some(verdicts), Some((mut last, used))) = (verdicts, ended) {
+            if latent_tx.send(Frame::TailQuery).is_err() {
+                return Ok(());
+            }
+            let mut more = verdicts.recv().unwrap_or(false);
+            for _ in used..chunk.frame_budget {
+                if !more {
+                    break;
+                }
+                let (next, _) = flow.step(model, Some(&last), &mut rng)?;
+                if latent_tx.send(Frame::Tail(model.latent_for_mimi(&next)?)).is_err() {
+                    return Ok(());
+                }
+                more = verdicts.recv().unwrap_or(false);
+                last = next;
+            }
         }
         if latent_tx.send(Frame::ChunkEnd).is_err() {
             return Ok(());
@@ -1379,6 +1521,7 @@ fn run_inline<Q: BackendQ>(
     mimi_init: crate::mimi::MimiDecoderState<f32, Q::B>,
     pcm_tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
     mut post: Chain,
+    fade_tail: Option<(FadeTail, usize)>,
 ) -> Result<()> {
     let mut mimi_state = mimi_init.clone();
     // The post-processing chain delays its output: its first `skip` samples are the zeros it
@@ -1389,20 +1532,20 @@ fn run_inline<Q: BackendQ>(
             Flow::start(model, base_state, cfg_base, graph.as_deref_mut(), &chunk.tokens)?;
         let mut prev: Option<Tensor<Q::T, Q::B>> = None;
         let mut eos = EosPolicy::new(chunk.frames_after_eos);
+        // The end of the last frame's audio, before post-processing, for a fade tail.
+        let mut last_pcm = Vec::new();
+        // The last frame and the frames used, when EOS ended the chunk rather than its budget.
+        let mut ended = None;
 
-        for _ in 0..chunk.frame_budget {
+        for used in 1..=chunk.frame_budget {
             let (next, frame_eos) = flow.step(model, prev.as_ref(), &mut rng)?;
-            let pcm = model
-                .decode_latent(&next, &mut mimi_state)
-                .and_then(|audio| audio.narrow(0, ..1)?.contiguous()?.to_vec())
-                .map(|mut pcm| {
-                    post.process(&mut pcm);
-                    let n = skip.min(pcm.len());
-                    skip -= n;
-                    pcm.drain(..n);
-                    pcm
-                })
-                .map_err(Error::from);
+            let pcm = decode_pcm(model, &next, &mut mimi_state).map(|mut pcm| {
+                if let Some((_, sample_rate)) = fade_tail {
+                    keep_end(&mut last_pcm, &pcm, sample_rate);
+                }
+                post_pcm(&mut post, &mut skip, &mut pcm);
+                pcm
+            });
             let failed = pcm.is_err();
             // A closed channel means the consumer went away; stop quietly and let the caller
             // report any error of its own.
@@ -1412,9 +1555,34 @@ fn run_inline<Q: BackendQ>(
             // Without guidance the eos logit is read back after the frame's audio, so the frame
             // waits on the device once instead of twice.
             if eos.should_stop(frame_eos.resolve(model)?) {
+                ended = Some((next, used));
                 break;
             }
             prev = Some(next);
+        }
+        // A fade tail stays inside the chunk's frame budget, which sized the KV cache.
+        if let (Some((tail, sample_rate)), Some((mut last, used))) = (fade_tail, ended)
+            && let Some(mut run) =
+                FadeRun::start(tail, sample_rate, &last_pcm, chunk.frame_budget - used)
+        {
+            while run.more() {
+                let (next, _) = flow.step(model, Some(&last), &mut rng)?;
+                let mut pcm = match decode_pcm(model, &next, &mut mimi_state) {
+                    Ok(pcm) => pcm,
+                    Err(e) => {
+                        let _ = pcm_tx.send(Err(e));
+                        return Ok(());
+                    }
+                };
+                if !run.take(&pcm) {
+                    break;
+                }
+                post_pcm(&mut post, &mut skip, &mut pcm);
+                if pcm_tx.send(Ok(pcm)).is_err() {
+                    return Ok(());
+                }
+                last = next;
+            }
         }
         mimi_state = mimi_init.clone();
     }
@@ -1881,6 +2049,7 @@ impl SynthBuilder {
                 cfg_coef: self.cfg_coef,
                 max_tokens_per_chunk: self.max_tokens_per_chunk,
                 post_process: self.post_process.clone(),
+                fade_tail: None,
             },
             normalize: self.normalize,
             conditioners,
@@ -2319,6 +2488,7 @@ mod tests {
             cfg_coef: None,
             max_tokens_per_chunk: 50,
             post_process: vec![],
+            fade_tail: None,
         }
     }
 
