@@ -99,13 +99,21 @@ impl EosPolicy {
 /// The tail [`EosPolicy`] runs is a fixed count of frames, enough for speech that has faded by
 /// the time the model signals the end. A loud ending (a laugh, a shout, a drawn-out "hmm") can
 /// still be sounding when the count runs out, and is then cut off mid-sound. With a fade tail,
-/// the end of that last frame is measured: when its last 20 ms are at least [`Self::threshold`]
-/// RMS, up to [`Self::max_frames`] more frames are generated, each kept only while the sound
-/// fades. A frame with any 20 ms louder than the end of the audio before it is a new sound the
-/// model started after deciding it was done: it is dropped, and the tail ends there.
+/// [`Self::frames`] more frames are generated after every EOS tail, without waiting to hear how
+/// it ended, and [`Self::keep`] then decides how many of them to keep:
 ///
-/// Off unless asked for, through [`crate::synth::SpeechOptions::fade_tail`]. [`FadeRun`] applies
-/// it to one chunk.
+/// - none when the EOS tail's last 20 ms are below [`Self::threshold`] RMS, which is how
+///   ordinary speech ends;
+/// - otherwise the frames up to the first that ends below the threshold, or else up to the one
+///   that ends quietest, but only when that is at most half as loud as where the EOS tail left
+///   off. A sound that holds or grows (a hum, a buzz) is not fading, and gets none;
+/// - never a frame with any 20 ms louder than the loudest of the EOS tail's last frame, nor any
+///   after it: that is a new sound the model started after deciding it was done.
+///
+/// Comparing against the whole last frame rather than its end lets a pulsed sound such as a
+/// laugh run on through its next burst.
+///
+/// Off unless asked for, through [`crate::synth::SpeechOptions::fade_tail`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FadeTail {
     /// RMS, of samples in [-1, 1], at or above which an ending still counts as sounding.
@@ -126,57 +134,64 @@ impl FadeTail {
         }
         Ok(())
     }
+
+    /// The frames to generate after an EOS tail that left `room` in the chunk's frame budget,
+    /// which sized the KV cache.
+    pub fn frames(&self, room: usize) -> usize {
+        self.max_frames.min(room)
+    }
+
+    /// Whether an EOS tail whose last frame's audio is `last`, at `sample_rate`, is still
+    /// sounding: only then can [`Self::keep`] keep anything, so the frames added after it need
+    /// not be decoded otherwise.
+    pub fn sounding(&self, sample_rate: usize, last: &[f32]) -> bool {
+        !last.is_empty() && rms(end(last, window(sample_rate))) >= self.threshold
+    }
+
+    /// How many of `frames`, the audio of the frames added after an EOS tail whose last frame's
+    /// audio is `last`, to keep, from the first; see the type's documentation.
+    pub fn keep(&self, sample_rate: usize, last: &[f32], frames: &[&[f32]]) -> usize {
+        if !self.sounding(sample_rate, last) {
+            return 0;
+        }
+        let window = window(sample_rate);
+        let loudest = peak(last, window) * NEW_SOUND;
+        let mut quietest = rms(end(last, window)) * FADED;
+        let mut kept = 0;
+        for (i, pcm) in frames.iter().enumerate() {
+            if peak(pcm, window) > loudest {
+                break;
+            }
+            let level = rms(end(pcm, window));
+            if level < self.threshold {
+                return i + 1;
+            }
+            if level <= quietest {
+                (kept, quietest) = (i + 1, level);
+            }
+        }
+        kept
+    }
 }
 
-/// How much louder than the end before it a kept tail frame may get.
-const FADE_SLACK: f32 = 1.1;
+/// How much louder than the loudest 20 ms of the EOS tail's last frame a kept tail frame may get.
+const NEW_SOUND: f32 = 1.1;
+/// How loud, against where the EOS tail left off, a kept tail may end.
+const FADED: f32 = 0.5;
 
-/// One chunk's [`FadeTail`], from the end of its EOS tail on.
-#[derive(Clone, Copy, Debug)]
-pub struct FadeRun {
-    threshold: f32,
-    window: usize,
-    /// End loudness of the audio so far.
-    level: f32,
-    /// Frames that may still be added.
-    left: usize,
+/// The 20 ms windows the fade tail measures.
+fn window(sample_rate: usize) -> usize {
+    (sample_rate / 50).max(1)
 }
 
-impl FadeRun {
-    /// The run after an EOS tail whose audio ends with `last` at `sample_rate`, with room for
-    /// `room` more frames in the chunk's budget; `None` when the ending has already faded.
-    pub fn start(tail: FadeTail, sample_rate: usize, last: &[f32], room: usize) -> Option<Self> {
-        let window = (sample_rate / 50).max(1);
-        let level = rms(&last[last.len().saturating_sub(window)..]);
-        let left = tail.max_frames.min(room);
-        (left > 0 && level >= tail.threshold).then_some(Self {
-            threshold: tail.threshold,
-            window,
-            level,
-            left,
-        })
-    }
+/// The last `window` samples of `pcm`.
+fn end(pcm: &[f32], window: usize) -> &[f32] {
+    &pcm[pcm.len().saturating_sub(window)..]
+}
 
-    /// Whether another frame may be generated.
-    pub fn more(&self) -> bool {
-        self.left > 0
-    }
-
-    /// Judges the next frame's audio: true to keep it. After a dropped frame, or one that has
-    /// faded below the threshold, [`Self::more`] is false.
-    pub fn take(&mut self, pcm: &[f32]) -> bool {
-        if self.left == 0 {
-            return false;
-        }
-        let peak = pcm.chunks(self.window).map(rms).fold(0.0, f32::max);
-        if peak > self.level * FADE_SLACK {
-            self.left = 0;
-            return false;
-        }
-        self.level = rms(&pcm[pcm.len().saturating_sub(self.window)..]);
-        self.left = if self.level >= self.threshold { self.left - 1 } else { 0 };
-        true
-    }
+/// The loudest `window` of `pcm`.
+fn peak(pcm: &[f32], window: usize) -> f32 {
+    pcm.chunks(window).map(rms).fold(0.0, f32::max)
 }
 
 fn rms(pcm: &[f32]) -> f32 {
@@ -720,43 +735,67 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_faded_ending_gets_no_fade_tail() {
-        assert!(FadeRun::start(TAIL, RATE, &tone(0.02, 0.001), 10).is_none());
-        assert!(FadeRun::start(TAIL, RATE, &[], 10).is_none());
+    /// How many of `frames` [`TAIL`] keeps after `last`.
+    fn kept(last: Vec<f32>, frames: &[Vec<f32>]) -> usize {
+        TAIL.keep(RATE, &last, &frames.iter().map(Vec::as_slice).collect::<Vec<_>>())
     }
 
     #[test]
-    fn a_loud_ending_runs_on_while_it_fades() {
-        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.2), 10).unwrap();
-        assert!(run.take(&tone(0.2, 0.1)));
-        assert!(run.more());
-        // Faded below the threshold: kept, and the last.
-        assert!(run.take(&tone(0.1, 0.005)));
-        assert!(!run.more());
-        assert!(!run.take(&tone(0.005, 0.0)));
+    fn a_faded_ending_gets_no_fade_tail() {
+        assert!(!TAIL.sounding(RATE, &tone(0.02, 0.001)));
+        assert!(!TAIL.sounding(RATE, &[]));
+        assert_eq!(kept(tone(0.02, 0.001), &[tone(0.001, 0.0)]), 0);
+        assert_eq!(kept(vec![], &[tone(0.001, 0.0)]), 0);
+    }
+
+    #[test]
+    fn a_loud_ending_runs_on_until_it_fades() {
+        assert!(TAIL.sounding(RATE, &tone(0.3, 0.2)));
+        // The second frame fades below the threshold: kept, and the last.
+        let frames = [tone(0.2, 0.1), tone(0.1, 0.005), tone(0.005, 0.0), tone(0.0, 0.0)];
+        assert_eq!(kept(tone(0.3, 0.2), &frames), 2);
+    }
+
+    #[test]
+    fn a_fade_tail_ends_where_the_sound_is_quietest() {
+        // Never below the threshold, but quietest after the second frame.
+        let frames = [tone(0.2, 0.1), tone(0.1, 0.05), tone(0.05, 0.08), tone(0.08, 0.1)];
+        assert_eq!(kept(tone(0.3, 0.2), &frames), 2);
+    }
+
+    #[test]
+    fn a_laugh_runs_on_through_its_next_burst() {
+        // The EOS tail ends between bursts; the next frame swells back to the frame's loudest,
+        // then dies away.
+        assert_eq!(kept(tone(0.3, 0.15), &[tone(0.15, 0.3), tone(0.3, 0.005)]), 2);
+    }
+
+    #[test]
+    fn a_sound_that_does_not_fade_gets_no_fade_tail() {
+        let steady = vec![tone(0.1, 0.1); 4];
+        assert_eq!(kept(tone(0.1, 0.1), &steady), 0);
+        // Fading a little is not enough.
+        let slow = [tone(0.1, 0.09), tone(0.09, 0.08), tone(0.08, 0.07), tone(0.07, 0.06)];
+        assert_eq!(kept(tone(0.1, 0.1), &slow), 0);
+        let rising = [tone(0.1, 0.105), tone(0.105, 0.11)];
+        assert_eq!(kept(tone(0.1, 0.1), &rising), 0);
     }
 
     #[test]
     fn a_new_sound_after_the_tail_is_dropped() {
-        let mut run = FadeRun::start(TAIL, RATE, &tone(0.1, 0.05), 10).unwrap();
-        assert!(!run.take(&tone(0.05, 0.3)));
-        assert!(!run.more());
+        assert_eq!(kept(tone(0.1, 0.05), &[tone(0.05, 0.3)]), 0);
+        // Kept up to the new sound, and nothing after it, however quiet.
+        let frames = [tone(0.2, 0.06), tone(0.06, 0.4), tone(0.0, 0.0)];
+        assert_eq!(kept(tone(0.3, 0.2), &frames), 1);
     }
 
     #[test]
     fn a_fade_tail_stops_at_its_frame_cap_and_the_budget() {
-        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 10).unwrap();
-        for _ in 0..4 {
-            assert!(run.take(&tone(0.3, 0.3)));
-        }
-        assert!(!run.more());
-        let mut run = FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 1).unwrap();
-        assert!(run.take(&tone(0.3, 0.3)));
-        assert!(!run.more());
-        assert!(FadeRun::start(TAIL, RATE, &tone(0.3, 0.3), 0).is_none());
-        let none = FadeTail { threshold: 0.02, max_frames: 0 };
-        assert!(FadeRun::start(none, RATE, &tone(0.3, 0.3), 10).is_none());
+        assert_eq!(TAIL.frames(10), 4);
+        assert_eq!(TAIL.frames(1), 1);
+        assert_eq!(TAIL.frames(0), 0);
+        assert_eq!(FadeTail { threshold: 0.02, max_frames: 0 }.frames(10), 0);
+        assert_eq!(kept(tone(0.3, 0.2), &[]), 0);
     }
 
     #[test]
