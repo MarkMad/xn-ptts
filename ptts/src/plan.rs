@@ -105,8 +105,10 @@ impl EosPolicy {
 /// - none when the EOS tail's last 20 ms are below [`Self::threshold`] RMS, which is how
 ///   ordinary speech ends;
 /// - otherwise the frames up to the first that ends below the threshold, or else up to the one
-///   that ends quietest, but only when that is at most half as loud as where the EOS tail left
-///   off. A sound that holds or grows (a hum, a buzz) is not fading, and gets none;
+///   that ends quietest, but only when that is at most 80% as loud as where the EOS tail left
+///   off. A sound that holds or grows (a hum, a buzz) is not fading, and gets none, while a
+///   long "mm-hmm" or "nooo", which on the 100M checkpoint falls to 55-75% within four frames,
+///   runs on;
 /// - never a frame with any 20 ms louder than the loudest of the EOS tail's last frame, nor any
 ///   after it: that is a new sound the model started after deciding it was done.
 ///
@@ -177,7 +179,7 @@ impl FadeTail {
 /// How much louder than the loudest 20 ms of the EOS tail's last frame a kept tail frame may get.
 const NEW_SOUND: f32 = 1.1;
 /// How loud, against where the EOS tail left off, a kept tail may end.
-const FADED: f32 = 0.5;
+const FADED: f32 = 0.8;
 
 /// The 20 ms windows the fade tail measures.
 fn window(sample_rate: usize) -> usize {
@@ -774,11 +776,18 @@ mod tests {
     fn a_sound_that_does_not_fade_gets_no_fade_tail() {
         let steady = vec![tone(0.1, 0.1); 4];
         assert_eq!(kept(tone(0.1, 0.1), &steady), 0);
-        // Fading a little is not enough.
-        let slow = [tone(0.1, 0.09), tone(0.09, 0.08), tone(0.08, 0.07), tone(0.07, 0.06)];
-        assert_eq!(kept(tone(0.1, 0.1), &slow), 0);
+        // Barely fading is not enough.
+        let barely = [tone(0.1, 0.098), tone(0.098, 0.095), tone(0.095, 0.093), tone(0.093, 0.09)];
+        assert_eq!(kept(tone(0.1, 0.1), &barely), 0);
         let rising = [tone(0.1, 0.105), tone(0.105, 0.11)];
         assert_eq!(kept(tone(0.1, 0.1), &rising), 0);
+    }
+
+    #[test]
+    fn a_slow_fade_runs_on() {
+        // Russell's "Mm-hmm." on the 100M checkpoint: 57% of its level after four frames.
+        let slow = [tone(0.15, 0.15), tone(0.15, 0.135), tone(0.135, 0.114), tone(0.114, 0.085)];
+        assert_eq!(kept(tone(0.15, 0.15), &slow), 4);
     }
 
     #[test]
