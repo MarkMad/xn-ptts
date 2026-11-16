@@ -77,11 +77,14 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     /**
      * Let each chunk run on, by up to [maxFrames] frames, while its ending is at least [threshold]
      * RMS and fading, so a loud ending such as a laugh is not cut off mid-sound. 0.02 and 4 suit
-     * the published checkpoints; 0 frames turns it off, the default. Throws for a threshold that is
-     * not finite and above zero.
+     * the published checkpoints; 0 frames turns it off, the default. Throws for a negative
+     * [maxFrames], and, unless turning it off, for a threshold that is not finite and above zero.
      */
-    fun setFadeTail(threshold: Float, maxFrames: Int) =
+    fun setFadeTail(threshold: Float, maxFrames: Int) {
+        // The C side takes a uint32_t: a negative count would arrive as about four billion.
+        require(maxFrames >= 0) { "maxFrames must be >= 0, got $maxFrames" }
         check(lib.ptts_set_fade_tail(open(), threshold, maxFrames))
+    }
 
     /**
      * Speak [text], handing [onAudio] each piece of audio as soon as it is made: 24 kHz mono
