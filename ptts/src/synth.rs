@@ -1031,6 +1031,13 @@ impl<Q: BackendQ> SessionOf<Q> {
             // back, the flow-LM loses one decode's time, far ahead of real time.
             let (first_tx, first_rx) = std::sync::mpsc::channel::<()>();
 
+            // With a fade tail, the flow-LM asks the decoder, which alone hears the audio, whether
+            // a chunk's ending is still sounding, once per chunk EOS ends: only then does it
+            // generate the tail's frames, which most chunks do not need. The wait is short, since
+            // the decoder keeps up with the flow-LM, and free on a stream's last chunk, whose
+            // audio is waited for anyway.
+            let (sounding_tx, sounding_rx) = std::sync::mpsc::channel::<bool>();
+
             // Decoder: latents in, PCM out. Reset between chunks so each chunk
             // starts from a clean codec state, matching the pre-refactor behavior.
             let decode_model = Arc::clone(&self.model);
@@ -1046,6 +1053,8 @@ impl<Q: BackendQ> SessionOf<Q> {
                 // frames of the chunk under way, both for `finish_tail`.
                 let mut last = Vec::new();
                 let mut tail = Vec::new();
+                let sounding =
+                    |last: &[f32]| fade_tail.is_some_and(|t| t.sounding(sample_rate, last));
                 // Ends a chunk: its fade tail out, and the codec state reset so each chunk
                 // starts from a clean one, matching the pre-refactor behavior. False when the
                 // stream is over.
@@ -1081,6 +1090,12 @@ impl<Q: BackendQ> SessionOf<Q> {
                             }
                             continue;
                         }
+                        Frame::TailQuery => {
+                            if sounding_tx.send(sounding(&last)).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         Frame::Tail(latent) => match decode_model.mimi_latent(latent) {
                             Ok(latent) => {
                                 tail.push(latent);
@@ -1104,7 +1119,7 @@ impl<Q: BackendQ> SessionOf<Q> {
                     // call over several is much cheaper than one call per frame.
                     // Only what is already waiting is taken, so no frame is ever
                     // held back for a batch to fill — the first one included.
-                    let mut reset_after = false;
+                    let (mut reset_after, mut answer_after) = (false, false);
                     let mut batch = vec![first];
                     while batch.len() < DECODE_BATCH {
                         let Ok(frame) = latent_rx.try_recv() else { break };
@@ -1113,6 +1128,12 @@ impl<Q: BackendQ> SessionOf<Q> {
                             // batch has to stop here and resume on the next frame.
                             Frame::ChunkEnd => {
                                 reset_after = true;
+                                break;
+                            }
+                            // Answered once this batch, which ends the EOS tail, is decoded;
+                            // the flow-LM waits for the answer, so nothing follows it yet.
+                            Frame::TailQuery => {
+                                answer_after = true;
                                 break;
                             }
                             // Held for the chunk's end; only more of them and the end follow.
@@ -1157,6 +1178,9 @@ impl<Q: BackendQ> SessionOf<Q> {
                     if let Some(first_tx) = first_tx.take() {
                         let _ = first_tx.send(());
                     }
+                    if answer_after && sounding_tx.send(sounding(&last)).is_err() {
+                        return;
+                    }
                     if reset_after && !end_chunk!() {
                         return;
                     }
@@ -1178,9 +1202,8 @@ impl<Q: BackendQ> SessionOf<Q> {
                 let _in_flight = in_flight;
                 let result = with_step_graph(&graphs, &base_state, &cfg_base, |graph| {
                     let (base, cfg) = (&base_state, &cfg_base);
-                    run_backbone(
-                        &model, graph, chunks, base, cfg, rng, &latent_tx, first_rx, fade_tail,
-                    )
+                    let fade = fade_tail.map(|tail| (tail, &sounding_rx));
+                    run_backbone(&model, graph, chunks, base, cfg, rng, &latent_tx, first_rx, fade)
                 });
                 if let Err(e) = result {
                     let _ = pcm_tx.send(Err(e));
@@ -1296,6 +1319,9 @@ const DECODE_BATCH: usize = LATENT_QUEUE;
 enum Frame<Q: BackendQ> {
     Latent(MimiLatent<Q>),
     ChunkEnd,
+    /// The EOS tail has ended: is it still sounding? The decoder answers once it has decoded
+    /// everything sent before, and the flow-LM sends the fade tail's frames only on a yes.
+    TailQuery,
     /// A frame the fade tail added after the EOS tail. The decoder holds these until the
     /// chunk's end, then decodes them and keeps those [`FadeTail::keep`] picks.
     Tail(MimiLatent<Q>),
@@ -1330,8 +1356,8 @@ fn keep_last_frame(last: &mut Vec<f32>, pcm: &[f32], frames: usize) {
 }
 
 /// Decodes a chunk's fade-tail frames, `latents`, after an EOS tail whose last frame's audio is
-/// `last`, and sends on the ones [`FadeTail::keep`] picks. Skips decoding when the EOS tail had
-/// already faded, since then none can be kept. False when the stream is over.
+/// `last`, and sends on the ones [`FadeTail::keep`] picks. The flow-LM only sends them after a
+/// sounding ending, but `keep` checks again. False when the stream is over.
 #[allow(clippy::too_many_arguments)]
 fn finish_tail<Q: BackendQ>(
     model: &TTSModel<Q>,
@@ -1345,7 +1371,7 @@ fn finish_tail<Q: BackendQ>(
     skip: &mut usize,
     tx: &std::sync::mpsc::SyncSender<Result<Vec<f32>>>,
 ) -> bool {
-    if latents.is_empty() || !tail.sounding(sample_rate, last) {
+    if latents.is_empty() {
         return true;
     }
     let pcm = Tensor::cat(&latents.iter().collect::<Vec<_>>(), 1)
@@ -1473,7 +1499,7 @@ fn run_backbone<Q: BackendQ>(
     mut rng: Box<dyn crate::flow_lm::Rng + Send>,
     latent_tx: &std::sync::mpsc::SyncSender<Frame<Q>>,
     first_decoded: std::sync::mpsc::Receiver<()>,
-    fade_tail: Option<FadeTail>,
+    fade_tail: Option<(FadeTail, &std::sync::mpsc::Receiver<bool>)>,
 ) -> Result<()> {
     // Taken after the first frame: only the stream's first audio is worth the wait.
     let mut first_decoded = Some(first_decoded);
@@ -1505,10 +1531,16 @@ fn run_backbone<Q: BackendQ>(
             }
             prev = Some(next);
         }
-        // Only the decoder hears how the EOS tail ended, so the fade tail's frames go out without
-        // waiting to ask, and the decoder keeps what it judges worth keeping at the chunk's end.
-        if let (Some(tail), Some((mut last, used))) = (fade_tail, ended) {
-            for _ in 0..tail.frames(chunk.frame_budget - used) {
+        // Only the decoder hears how the EOS tail ended: ask it once, and on a yes send the fade
+        // tail's frames without waiting again; the decoder keeps what it judges worth keeping at
+        // the chunk's end. A closed channel means the decoder stopped, as above.
+        if let (Some((tail, sounding)), Some((mut last, used))) = (fade_tail, ended) {
+            if latent_tx.send(Frame::TailQuery).is_err() {
+                return Ok(());
+            }
+            let Ok(sounding) = sounding.recv() else { return Ok(()) };
+            let frames = if sounding { tail.frames(chunk.frame_budget - used) } else { 0 };
+            for _ in 0..frames {
                 let (next, _) = flow.step(model, Some(&last), &mut rng)?;
                 if latent_tx.send(Frame::Tail(model.latent_for_mimi(&next)?)).is_err() {
                     return Ok(());
@@ -1578,21 +1610,19 @@ fn run_inline<Q: BackendQ>(
             }
             prev = Some(next);
         }
-        // As in `run_backbone`, every fade-tail frame is generated even when the EOS tail had
-        // faded, so both paths draw the same noise and a later chunk is the same take on each.
-        // They are only decoded when some may be kept.
-        if let (Some((tail, sample_rate)), Some((mut last, used))) = (fade_tail, ended) {
-            let sounding = tail.sounding(sample_rate, &last_pcm);
+        // As in `run_backbone`: the fade tail's frames only after an ending still sounding, all
+        // of them, then judged together, so both paths draw the same noise.
+        if let (Some((tail, sample_rate)), Some((mut last, used))) = (fade_tail, ended)
+            && tail.sounding(sample_rate, &last_pcm)
+        {
             let mut frames = Vec::new();
             for _ in 0..tail.frames(chunk.frame_budget - used) {
                 let (next, _) = flow.step(model, Some(&last), &mut rng)?;
-                if sounding {
-                    match decode_pcm(model, &next, &mut mimi_state) {
-                        Ok(pcm) => frames.push(pcm),
-                        Err(e) => {
-                            let _ = pcm_tx.send(Err(e));
-                            return Ok(());
-                        }
+                match decode_pcm(model, &next, &mut mimi_state) {
+                    Ok(pcm) => frames.push(pcm),
+                    Err(e) => {
+                        let _ = pcm_tx.send(Err(e));
+                        return Ok(());
                     }
                 }
                 last = next;
