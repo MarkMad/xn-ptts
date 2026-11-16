@@ -256,8 +256,9 @@ pub unsafe extern "C" fn ptts_set_seed(h: *mut PttsHandle, seed: u64) {
 /// mid-sound; with this, when the last 20 ms of a chunk are at least `threshold` RMS (of samples
 /// in [-1, 1]), up to `max_frames` more frames are generated and each kept only while the sound
 /// fades. 0.02 and 4 suit the published checkpoints. `max_frames` 0 turns it off, as it is by
-/// default. Returns false for a threshold that is not finite and above zero, and on Core ML,
-/// which does not support it; see `ptts_last_error`.
+/// default, whatever `threshold` is, and always succeeds, on Core ML too. Otherwise returns false
+/// for a threshold that is not finite and above zero, and on Core ML, which does not support it;
+/// see `ptts_last_error`.
 ///
 /// # Safety
 /// `h` must come from `ptts_new`.
