@@ -99,11 +99,11 @@ impl EosPolicy {
 /// The tail [`EosPolicy`] runs is a fixed count of frames, enough for speech that has faded by
 /// the time the model signals the end. A loud ending (a laugh, a shout, a drawn-out "hmm") can
 /// still be sounding when the count runs out, and is then cut off mid-sound. With a fade tail,
-/// [`Self::frames`] more frames are generated after every EOS tail, without waiting to hear how
-/// it ended, and [`Self::keep`] then decides how many of them to keep:
+/// an EOS tail still [`Self::sounding`] gets [`Self::frames`] more frames, generated together,
+/// and [`Self::keep`] then decides how many of them to keep:
 ///
 /// - none when the EOS tail's last 20 ms are below [`Self::threshold`] RMS, which is how
-///   ordinary speech ends;
+///   ordinary speech ends, and then none are generated either;
 /// - otherwise the frames up to the first that ends below the threshold, or else up to the one
 ///   that ends quietest, but only when that is at most 80% as loud as where the EOS tail left
 ///   off. A sound that holds or grows (a hum, a buzz) is not fading, and gets none, while a
