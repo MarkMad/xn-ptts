@@ -8,7 +8,7 @@
 use crate::{PTTS_UNIT_CPU, PttsResult};
 use ptts::checkpoint::read_config;
 use ptts::preprocess::Normalize;
-use ptts::synth::{DeviceKind, Quant, SpeechOptions, Synth, SynthBuilder};
+use ptts::synth::{DeviceKind, FadeTail, Quant, SpeechOptions, Synth, SynthBuilder};
 use std::path::Path;
 
 /// Weight files tried in order, with the format each loads as.
@@ -23,6 +23,8 @@ pub struct Engine {
     /// Left `None`, the builder's defaults.
     temperature: Option<f32>,
     seed: Option<u64>,
+    /// Off unless set.
+    fade_tail: Option<FadeTail>,
     /// Applied here rather than by `synth`, which is built with `Normalize::OFF`, so that
     /// `set_language` can change it without a reload. `Synth` applies it first thing anyway.
     normalize: Normalize,
@@ -62,6 +64,7 @@ impl Engine {
             voice: synth.default_voice(),
             temperature: None,
             seed: None,
+            fade_tail: None,
             normalize,
             synth,
             frame_size,
@@ -98,6 +101,13 @@ impl Engine {
         self.seed = Some(seed);
     }
 
+    /// Let each chunk run on past its EOS tail while the voice is still sounding, from the next
+    /// utterance on, or not with `None`. The tail is already checked.
+    pub fn set_fade_tail(&mut self, tail: Option<FadeTail>) -> Result<(), String> {
+        self.fade_tail = tail;
+        Ok(())
+    }
+
     pub fn speak(
         &mut self,
         text: &str,
@@ -108,6 +118,7 @@ impl Engine {
             voice: self.voice.clone(),
             temperature: self.temperature,
             seed: self.seed,
+            fade_tail: self.fade_tail,
             ..Default::default()
         };
         let text = self.normalize.apply(text);

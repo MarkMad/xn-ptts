@@ -251,6 +251,39 @@ pub unsafe extern "C" fn ptts_set_seed(h: *mut PttsHandle, seed: u64) {
     unsafe { (*h).engine.set_seed(seed) }
 }
 
+/// Let each chunk run on past the model's end-of-speech tail while the voice is still sounding,
+/// from the next `ptts_speak` on. The fixed tail can cut a loud ending (a laugh, a shout) off
+/// mid-sound; with this, when the last 20 ms of a chunk are at least `threshold` RMS (of samples
+/// in [-1, 1]), up to `max_frames` more frames are generated and each kept only while the sound
+/// fades. 0.02 and 4 suit the published checkpoints. `max_frames` 0 turns it off, as it is by
+/// default, whatever `threshold` is, and always succeeds, on Core ML too. Otherwise returns false
+/// for a threshold that is not finite and above zero, and on Core ML, which does not support it;
+/// see `ptts_last_error`.
+///
+/// # Safety
+/// `h` must come from `ptts_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ptts_set_fade_tail(
+    h: *mut PttsHandle,
+    threshold: f32,
+    max_frames: u32,
+) -> bool {
+    let h = unsafe { &mut *h };
+    let result = if max_frames == 0 {
+        h.engine.set_fade_tail(None)
+    } else {
+        let tail = ptts::plan::FadeTail { threshold, max_frames: max_frames as usize };
+        tail.check().map_err(|e| e.to_string()).and_then(|()| h.engine.set_fade_tail(Some(tail)))
+    };
+    match result {
+        Ok(()) => true,
+        Err(e) => {
+            h.last_error = Some(c_string(&e));
+            false
+        }
+    }
+}
+
 /// The last error on `h`, or, when `h` is null, the last `ptts_new` failure on this thread.
 /// Borrowed until the next failing call.
 ///
