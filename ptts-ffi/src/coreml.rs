@@ -127,6 +127,15 @@ impl Engine {
         self.phonon.set_seed(seed);
     }
 
+    /// The Core ML driver runs its own generation loop, which has no fade tail yet; turning it
+    /// off is accepted, since it is off.
+    pub fn set_fade_tail(&mut self, tail: Option<ptts::plan::FadeTail>) -> Result<(), String> {
+        match tail {
+            None => Ok(()),
+            Some(_) => Err("the fade tail is not supported by the Core ML engine".into()),
+        }
+    }
+
     /// Split `text` into chunks the prefill graph takes.
     ///
     /// The chunks every frontend makes, from [`ptts::plan::chunks`], with one addition the graph

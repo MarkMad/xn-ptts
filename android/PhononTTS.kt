@@ -75,6 +75,18 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
     fun setSeed(seed: Long) = lib.ptts_set_seed(open(), seed)
 
     /**
+     * Let each chunk run on, by up to [maxFrames] frames, while its ending is at least [threshold]
+     * RMS and fading, so a loud ending such as a laugh is not cut off mid-sound. 0.02 and 4 suit
+     * the published checkpoints; 0 frames turns it off, the default. Throws for a negative
+     * [maxFrames], and, unless turning it off, for a threshold that is not finite and above zero.
+     */
+    fun setFadeTail(threshold: Float, maxFrames: Int) {
+        // The C side takes a uint32_t: a negative count would arrive as about four billion.
+        require(maxFrames >= 0) { "maxFrames must be >= 0, got $maxFrames" }
+        check(lib.ptts_set_fade_tail(open(), threshold, maxFrames))
+    }
+
+    /**
      * Speak [text], handing [onAudio] each piece of audio as soon as it is made: 24 kHz mono
      * floats in [-1, 1]. Return false from [onAudio] to stop early. Returns once all the audio
      * has been handed over, with the utterance's timings. What [onAudio] throws, [speak] rethrows.
@@ -124,6 +136,7 @@ class PhononTTS(modelDir: String, lang: String) : AutoCloseable {
         fun ptts_languages(h: Pointer): Pointer
         fun ptts_set_temperature(h: Pointer, temperature: Float): Byte
         fun ptts_set_seed(h: Pointer, seed: Long)
+        fun ptts_set_fade_tail(h: Pointer, threshold: Float, maxFrames: Int): Byte
         fun ptts_last_error(h: Pointer?): String?
         fun ptts_free(h: Pointer)
 
